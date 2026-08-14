@@ -1,5 +1,6 @@
 """Converters for transforming telemetry data to Session format."""
 
+from .atif_session_mapper import ATIFSessionMapper
 from .cloudwatch_parser import CloudWatchLogsParser, parse_cloudwatch_logs
 from .cloudwatch_session_mapper import CloudWatchSessionMapper
 from .langchain_otel_session_mapper import LangChainOtelSessionMapper
@@ -12,6 +13,7 @@ from .utils import detect_otel_mapper, get_scope_name, readable_spans_to_dicts
 __all__ = [
     "CloudWatchLogsParser",
     "CloudWatchSessionMapper",
+    "ATIFSessionMapper",
     "GenAIConventionVersion",
     "LangChainOtelSessionMapper",
     "OpenInferenceSessionMapper",

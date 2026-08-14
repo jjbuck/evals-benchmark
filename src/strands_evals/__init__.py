@@ -1,10 +1,26 @@
-from . import chaos, detectors, evaluators, extractors, generators, providers, simulation, telemetry, types
+from . import (
+    benchmarks,
+    chaos,
+    detectors,
+    evaluators,
+    extractors,
+    generators,
+    providers,
+    simulation,
+    targets,
+    task_environments,
+    telemetry,
+    types,
+)
+from .benchmarks import Benchmark, load_benchmark
 from .case import Case
 from .eval_task_handler import EvalTaskHandler, TracedHandler, eval_task
 from .evaluation_data_store import EvaluationDataStore
 from .experiment import Experiment
 from .local_file_task_result_store import LocalFileTaskResultStore
 from .simulation import ActorSimulator, UserSimulator
+from .targets import StrandsAgentTarget
+from .task_environments import LocalContainers
 from .telemetry import StrandsEvalsTelemetry, get_tracer
 from .types.detector import DiagnosisConfig
 from .types.evaluation_report import EvaluationReport
@@ -13,12 +29,17 @@ __all__ = [
     "DiagnosisConfig",
     "Experiment",
     "Case",
+    "Benchmark",
+    "load_benchmark",
+    "StrandsAgentTarget",
+    "LocalContainers",
     "LocalFileTaskResultStore",
     "EvaluationDataStore",
     "EvaluationReport",
     "EvalTaskHandler",
     "TracedHandler",
     "eval_task",
+    "benchmarks",
     "chaos",
     "detectors",
     "evaluators",
@@ -27,6 +48,8 @@ __all__ = [
     "types",
     "generators",
     "simulation",
+    "targets",
+    "task_environments",
     "telemetry",
     "StrandsEvalsTelemetry",
     "get_tracer",

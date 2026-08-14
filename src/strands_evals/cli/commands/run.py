@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
 import logging
 import sys
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from ...case import Case
@@ -15,6 +19,10 @@ from ...evaluators.evaluator import Evaluator
 from ...evaluators.output_evaluator import OutputEvaluator
 from ...experiment import Experiment
 from ...local_file_task_result_store import LocalFileTaskResultStore
+from ...run_report import RunReport
+from ...runner import run_experiment
+from ...task_environments import LocalContainers
+from ...trials import ExecutionRequest, TrialLimits, TrialStatus
 from ...types.detector import ConfidenceLevel, DiagnosisConfig, DiagnosisTrigger
 from ...types.evaluation_report import EvaluationReport
 from ...types.trace import EvaluationLevel
@@ -22,6 +30,7 @@ from .._agent_task import synthesize_task_function
 from .._common import EXIT_BAD_INPUT, EXIT_FAILURES, EXIT_OK, emit_error, resolve_format
 from .._entrypoint import (
     EntryPointError,
+    import_attr,
     resolve_agent,
     resolve_custom_evaluators,
     resolve_evaluator_spec,
@@ -30,6 +39,23 @@ from .._entrypoint import (
 from .._io import read_text_input, write_text_output
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _working_directory_on_sys_path() -> Iterator[None]:
+    """Keep sibling target modules importable for the duration of a packaged run."""
+    cwd = str(Path.cwd())
+    added = cwd not in sys.path
+    if added:
+        sys.path.insert(0, cwd)
+    try:
+        yield
+    finally:
+        if added:
+            try:
+                sys.path.remove(cwd)
+            except ValueError:
+                pass
 
 
 def _parse_trace_attribute(raw: str) -> tuple[str, str]:
@@ -55,6 +81,16 @@ def _parse_fail_on(raw: str) -> tuple[str, float | None]:
             raise argparse.ArgumentTypeError(f"threshold in '{raw}' must be between 0.0 and 1.0")
         return "threshold", threshold
     raise argparse.ArgumentTypeError(f"--fail-on must be 'any', 'none', or 'threshold:0.X' (got '{raw}')")
+
+
+def _parse_positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got '{raw}'") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got '{raw}'")
+    return value
 
 
 def _build_diagnosis_config(args: argparse.Namespace) -> DiagnosisConfig | None:
@@ -85,6 +121,24 @@ def _ad_hoc_flags_set(args: argparse.Namespace) -> list[str]:
         set_flags.append("--rubric")
     if args.evaluator:
         set_flags.append("--evaluator")
+    return set_flags
+
+
+def _packaged_flags_set(args: argparse.Namespace) -> list[str]:
+    set_flags: list[str] = []
+    for attr, flag in (
+        ("task_environment", "--task-environment"),
+        ("task_environment_config", "--task-environment-config"),
+        ("run_dir", "--run-dir"),
+        ("resume_run_id", "--resume"),
+        ("trials_dir", "--trials-dir"),
+        ("repetitions", "--repetitions"),
+        ("timeout_multiplier", "--timeout-multiplier"),
+        ("agent_timeout_multiplier", "--agent-timeout-multiplier"),
+        ("verifier_timeout_multiplier", "--verifier-timeout-multiplier"),
+    ):
+        if getattr(args, attr) is not None:
+            set_flags.append(flag)
     return set_flags
 
 
@@ -173,16 +227,7 @@ def _check_ad_hoc_evaluator_compat(args: argparse.Namespace, evaluators: list[Ev
 
 
 def _validate_args(args: argparse.Namespace) -> str | None:
-    """Return an error string if argument combinations are invalid, else None.
-
-    Three rules:
-      1. EXPERIMENT_FILE and any ad-hoc flag are mutually exclusive — pick a
-         mode.
-      2. Without EXPERIMENT_FILE the user must supply `--input` or
-         `--input-file`; otherwise there is nothing to evaluate.
-      3. In ad-hoc mode at least one evaluator must be derivable: an explicit
-         `--evaluator` or an `--expected-output` (which defaults to `Contains`).
-    """
+    """Validate combinations that do not require loading the experiment."""
     ad_hoc = _ad_hoc_flags_set(args)
     if args.experiment_file is not None and ad_hoc:
         joined = ", ".join(ad_hoc)
@@ -191,13 +236,86 @@ def _validate_args(args: argparse.Namespace) -> str | None:
             f"either pass an experiment file or use --input + --evaluator/--expected-output."
         )
     if args.experiment_file is None:
+        packaged_flags = _packaged_flags_set(args)
+        if packaged_flags:
+            return f"an experiment factory is required when using {', '.join(packaged_flags)}."
         if args.input is None and args.input_file is None:
             return "EXPERIMENT_FILE or --input/--input-file is required."
+        if args.agent is None and args.task is None:
+            return "ad-hoc mode requires --agent or --task."
         if not args.evaluator and args.expected_output is None and args.rubric is None:
             return (
                 "ad-hoc mode requires --evaluator, --expected-output (auto-wires Contains), "
                 "or --rubric (auto-wires OutputEvaluator)."
             )
+    return None
+
+
+def _read_json_object(path: str | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, dict):
+        raise EntryPointError(f"{path} must contain a JSON object")
+    return value
+
+
+def _load_experiment_reference(
+    spec: str,
+    *,
+    custom_evaluators: list[type[Evaluator]],
+) -> Experiment:
+    """Load serialized JSON or invoke a zero-argument experiment factory."""
+    path = Path(spec).expanduser()
+    if path.suffix == ".json" or path.is_file():
+        return Experiment.from_file(str(path), custom_evaluators=custom_evaluators)
+
+    factory = import_attr(spec)
+    if not callable(factory):
+        raise EntryPointError(f"experiment factory {spec!r} is not callable")
+    try:
+        experiment = factory()
+    except TypeError as error:
+        raise EntryPointError(f"experiment factory {spec!r} must be callable without arguments: {error}") from error
+    if not isinstance(experiment, Experiment):
+        raise EntryPointError(
+            f"experiment factory {spec!r} returned {type(experiment).__name__}; expected strands_evals.Experiment"
+        )
+    return experiment
+
+
+def _with_repetitions(experiment: Experiment, repetitions: int | None) -> Experiment:
+    if repetitions is None or repetitions == experiment.repetitions:
+        return experiment
+    return Experiment(
+        cases=experiment.cases,
+        evaluators=experiment.evaluators,
+        target=experiment.target,
+        repetitions=repetitions,
+        packaged_tasks=experiment.packaged_tasks,
+    )
+
+
+def _validate_packaged_args(args: argparse.Namespace) -> str | None:
+    conflicts = []
+    if args.agent is not None:
+        conflicts.append("--agent")
+    if args.task is not None:
+        conflicts.append("--task")
+    if args.trace_attributes:
+        conflicts.append("--trace-attributes")
+    if args.data_store is not None:
+        conflicts.append("--data-store")
+    if args.diagnose is not None:
+        conflicts.append("--diagnose")
+    if args.custom_evaluator:
+        conflicts.append("--custom-evaluator")
+    if args.interactive:
+        conflicts.append("--interactive")
+    if conflicts:
+        return "a self-contained packaged experiment cannot be combined with " + ", ".join(conflicts)
+    if args.task_environment not in (None, "local-containers"):
+        return "Only --task-environment local-containers is currently supported."
     return None
 
 
@@ -214,6 +332,21 @@ def _decide_exit_code(report: EvaluationReport, fail_on: tuple[str, float | None
     if threshold is None:
         raise ValueError("--fail-on=threshold:X requires a numeric threshold")
     return EXIT_FAILURES if report.overall_score < threshold else EXIT_OK
+
+
+def _decide_packaged_exit_code(
+    report: RunReport,
+    fail_on: tuple[str, float | None],
+) -> int:
+    mode, threshold = fail_on
+    if mode == "none":
+        return EXIT_OK
+    if mode == "any":
+        return EXIT_FAILURES if any(result.status != TrialStatus.COMPLETED for result in report.results) else EXIT_OK
+    if threshold is None:
+        raise ValueError("--fail-on=threshold:X requires a numeric threshold")
+    score = report.compatibility_overall_score
+    return EXIT_FAILURES if score is None or score < threshold else EXIT_OK
 
 
 def _print_summary(report: EvaluationReport) -> None:
@@ -240,6 +373,42 @@ def _print_summary(report: EvaluationReport) -> None:
 
     parts.append(f"overall: {report.overall_score:.2f}")
     print(" | ".join(parts), file=sys.stderr)  # noqa: T201
+
+
+def _print_packaged_summary(report: RunReport) -> None:
+    statuses: dict[str, int] = {}
+    for result in report.results:
+        statuses[result.status.value] = statuses.get(result.status.value, 0) + 1
+    status_text = ", ".join(f"{name}={count}" for name, count in sorted(statuses.items()))
+    score = report.compatibility_overall_score
+    score_text = "unavailable" if score is None else f"{score:.4f}"
+    print(  # noqa: T201
+        f"strands-evals run | run_id={report.manifest.run_id} | {status_text} | primary={score_text}",
+        file=sys.stderr,
+    )
+
+
+def _display_packaged(report: RunReport) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(title=f"Run {report.manifest.run_id}")
+    table.add_column("Metric")
+    table.add_column("Mean", justify="right")
+    table.add_column("Valid", justify="right")
+    table.add_column("Unavailable", justify="right")
+    table.add_column("Failed", justify="right")
+    table.add_column("Invalid", justify="right")
+    for name, summary in sorted(report.metric_summaries.items()):
+        table.add_row(
+            name,
+            "" if summary.mean is None else f"{summary.mean:.4f}",
+            str(summary.valid),
+            str(summary.unavailable),
+            str(summary.failed),
+            str(summary.invalid),
+        )
+    Console().print(table)
 
 
 def _trace_attrs_dict(pairs: list[tuple[str, str]] | None) -> dict[str, Any]:
@@ -299,9 +468,65 @@ def _run(args: argparse.Namespace) -> int:
 
     diagnosis_config = _build_diagnosis_config(args)
 
+    task_function: Any
     if args.experiment_file is not None:
         custom_evaluators = resolve_custom_evaluators(args.custom_evaluator or [])
-        loaded = Experiment.from_file(args.experiment_file, custom_evaluators=custom_evaluators)
+        loaded = _load_experiment_reference(
+            args.experiment_file,
+            custom_evaluators=custom_evaluators,
+        )
+        if loaded.target is not None:
+            packaged_error = _validate_packaged_args(args)
+            if packaged_error is not None:
+                emit_error(packaged_error)
+                return EXIT_BAD_INPUT
+            experiment = _with_repetitions(loaded, args.repetitions)
+            from ...integrations.harbor import HarborTrialExecutor
+
+            run_root = Path(args.run_dir or ".strands-evals")
+            with _working_directory_on_sys_path():
+                report = asyncio.run(
+                    run_experiment(
+                        experiment,
+                        executor=HarborTrialExecutor(Path(args.trials_dir or run_root / "harbor-trials")),
+                        execution=ExecutionRequest(
+                            task_environment=LocalContainers(options=_read_json_object(args.task_environment_config)),
+                            max_concurrency=args.max_workers,
+                            limits=TrialLimits(
+                                timeout_multiplier=args.timeout_multiplier or 1.0,
+                                agent_timeout_multiplier=args.agent_timeout_multiplier,
+                                verifier_timeout_multiplier=(args.verifier_timeout_multiplier),
+                            ),
+                            output_dir=run_root,
+                            resume_run_id=args.resume_run_id,
+                        ),
+                    )
+                )
+            if args.output is not None:
+                write_text_output(report.model_dump_json(indent=2), args.output)
+            if args.display:
+                _display_packaged(report)
+            elif args.output is None and resolve_format(args) == "json":
+                sys.stdout.write(report.model_dump_json(indent=2) + "\n")
+            elif args.output is None:
+                _display_packaged(report)
+            _print_packaged_summary(report)
+            if args.exit_zero:
+                return EXIT_OK
+            return _decide_packaged_exit_code(report, args.fail_on)
+
+        packaged_flags = _packaged_flags_set(args)
+        if packaged_flags:
+            emit_error(
+                f"packaged-run flags require an experiment that declares a target; got {', '.join(packaged_flags)}"
+            )
+            return EXIT_BAD_INPUT
+        if args.agent is None and args.task is None:
+            emit_error(
+                "a case-based experiment requires --agent or --task; "
+                "self-contained experiment factories declare target instead"
+            )
+            return EXIT_BAD_INPUT
         # Experiment.from_file does not accept diagnosis_config; rebuild via the
         # public constructor so we don't poke private attrs. Cases are deep-copied
         # by the property accessor, which is fine for a one-shot CLI run.
@@ -387,13 +612,10 @@ def add_subparser(
         parents=[parent],
         help="run an experiment against an agent or task callable",
         description=(
-            "Load an Experiment, resolve --agent or --task, execute "
-            "run_evaluations_async, and write a flattened EvaluationReport. "
-            "--agent synthesizes the standard task wrapper (telemetry → invoke "
-            "→ Session mapping); --task is the escape hatch for custom shapes. "
-            "Pass EXPERIMENT_FILE to run a serialized experiment, or omit it "
-            "and supply --input + --evaluator/--expected-output for an ad-hoc "
-            "single-case run without authoring an experiment file."
+            "Run a serialized Experiment, a module:factory that returns a "
+            "self-contained packaged Experiment, or an ad-hoc case. Packaged "
+            "experiments declare their target and tasks; legacy case-based "
+            "experiments use --agent or --task."
         ),
     )
     parser.add_argument(
@@ -401,10 +623,64 @@ def add_subparser(
         metavar="EXPERIMENT_FILE",
         nargs="?",
         default=None,
-        help=(
-            "path to a serialized Experiment JSON file. Omit to run in ad-hoc "
-            "single-case mode using --input + --evaluator/--expected-output."
-        ),
+        help=("serialized Experiment JSON or module:factory returning Experiment. Omit for ad-hoc single-case mode."),
+    )
+
+    packaged = parser.add_argument_group("self-contained packaged experiment")
+    packaged.add_argument(
+        "--task-environment",
+        choices=["local-containers"],
+        default=None,
+        help="task placement selected for the executor (currently: local-containers)",
+    )
+    packaged.add_argument(
+        "--task-environment-config",
+        metavar="PATH",
+        default=None,
+        help="JSON object with Harbor Docker environment options",
+    )
+    packaged.add_argument(
+        "--run-dir",
+        metavar="DIR",
+        default=None,
+        help="run manifest/result root (default: .strands-evals)",
+    )
+    packaged.add_argument(
+        "--resume",
+        dest="resume_run_id",
+        metavar="RUN_ID",
+        default=None,
+        help="resume a run only when its manifest fingerprint still matches",
+    )
+    packaged.add_argument(
+        "--trials-dir",
+        metavar="DIR",
+        default=None,
+        help="Harbor trial artifacts (default: RUN_DIR/harbor-trials)",
+    )
+    packaged.add_argument(
+        "--repetitions",
+        type=_parse_positive_int,
+        default=None,
+        help="override the packaged experiment's attempts per task",
+    )
+    packaged.add_argument(
+        "--timeout-multiplier",
+        type=float,
+        default=None,
+        help="Harbor timeout multiplier for all trial phases (default: 1.0)",
+    )
+    packaged.add_argument(
+        "--agent-timeout-multiplier",
+        type=float,
+        default=None,
+        help="optional Harbor agent-phase timeout multiplier",
+    )
+    packaged.add_argument(
+        "--verifier-timeout-multiplier",
+        type=float,
+        default=None,
+        help="optional Harbor verifier-phase timeout multiplier",
     )
 
     ad_hoc = parser.add_argument_group("ad-hoc case (no experiment file)")
@@ -462,7 +738,7 @@ def add_subparser(
         ),
     )
 
-    target = parser.add_mutually_exclusive_group(required=True)
+    target = parser.add_mutually_exclusive_group()
     target.add_argument(
         "--agent",
         metavar="MODULE:ATTR",

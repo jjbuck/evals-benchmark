@@ -17,6 +17,7 @@ from tenacity import (
 from typing_extensions import Any, Generic
 
 from .case import Case
+from .components import ComponentSnapshot
 from .detectors.diagnosis import diagnose_session
 from .evaluation_data_store import EvaluationDataStore
 from .evaluators.coherence_evaluator import CoherenceEvaluator
@@ -42,6 +43,8 @@ from .evaluators.stereotyping_evaluator import StereotypingEvaluator
 from .evaluators.tool_parameter_accuracy_evaluator import ToolParameterAccuracyEvaluator
 from .evaluators.tool_selection_accuracy_evaluator import ToolSelectionAccuracyEvaluator
 from .evaluators.trajectory_evaluator import TrajectoryEvaluator
+from .packaged_tasks import PackagedTaskRef
+from .targets import EvaluationTarget, target_from_snapshot
 from .telemetry import get_tracer, serialize
 from .telemetry._cloudwatch_logger import _send_to_cloudwatch
 from .types.detector import DiagnosisConfig
@@ -123,13 +126,22 @@ class Experiment(Generic[InputT, OutputT]):
         cases: list[Case[InputT, OutputT]] | None = None,
         evaluators: list[Evaluator[InputT, OutputT]] | None = None,
         diagnosis_config: DiagnosisConfig | None = None,
+        *,
+        target: EvaluationTarget | None = None,
+        repetitions: int = 1,
+        packaged_tasks: dict[str, PackagedTaskRef] | None = None,
     ):
+        if repetitions < 1:
+            raise ValueError("repetitions must be at least 1")
         self._cases = cases or []
         self._evaluators = evaluators or [Evaluator()]
         self._tracer = get_tracer()
 
         self._config_id = os.environ.get("EVALUATION_RESULTS_LOG_GROUP", "default-strands-evals")
         self._diagnosis_config = diagnosis_config
+        self._target = target
+        self._repetitions = repetitions
+        self._packaged_tasks = dict(packaged_tasks or {})
 
     @property
     def cases(self) -> list[Case[InputT, OutputT]]:
@@ -153,6 +165,21 @@ class Experiment(Generic[InputT, OutputT]):
             The list of evaluator instances configured for this experiment
         """
         return self._evaluators
+
+    @property
+    def target(self) -> EvaluationTarget | None:
+        """Return the configured system under test, if declared."""
+        return self._target
+
+    @property
+    def repetitions(self) -> int:
+        """Return the number of logical attempts configured for each case."""
+        return self._repetitions
+
+    @property
+    def packaged_tasks(self) -> dict[str, PackagedTaskRef]:
+        """Return packaged task references keyed by stable case ID."""
+        return dict(self._packaged_tasks)
 
     @cases.setter
     def cases(self, new_cases: list[Case[InputT, OutputT]]):
@@ -709,10 +736,17 @@ class Experiment(Generic[InputT, OutputT]):
         Return:
             A dictionary representation of the experiment.
         """
-        return {
+        data = {
             "cases": [case.model_dump() for case in self._cases],
             "evaluators": [evaluator.to_dict() for evaluator in self._evaluators],
         }
+        if self._target is not None:
+            data["target"] = self._target.snapshot().model_dump(mode="json")
+            data["repetitions"] = self._repetitions
+            data["packaged_tasks"] = {
+                case_id: task.model_dump(mode="json") for case_id, task in sorted(self._packaged_tasks.items())
+            }
+        return data
 
     def to_file(self, path: str):
         """
@@ -811,7 +845,20 @@ class Experiment(Generic[InputT, OutputT]):
                     f"all relevant custom evaluators are passed in."
                 )
 
-        return cls(cases=cases, evaluators=evaluators)
+        experiment_kwargs: dict[str, Any] = {
+            "cases": cases,
+            "evaluators": evaluators,
+        }
+        if data.get("target") is not None:
+            experiment_kwargs.update(
+                target=target_from_snapshot(ComponentSnapshot.model_validate(data["target"])),
+                repetitions=int(data.get("repetitions", 1)),
+                packaged_tasks={
+                    case_id: PackagedTaskRef.model_validate(value)
+                    for case_id, value in (data.get("packaged_tasks") or {}).items()
+                },
+            )
+        return cls(**experiment_kwargs)
 
     @classmethod
     def from_file(cls, path: str, custom_evaluators: list[type[Evaluator]] | None = None):

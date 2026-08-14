@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -204,9 +206,201 @@ def test_run_with_agent_callable_smoke(experiment_file: Path, capsys, tmp_path: 
     assert payload["cases"][0]["actual_output"] == "hello from build_agent"
 
 
-def test_run_requires_agent_or_task(experiment_file: Path):
-    with pytest.raises(SystemExit):
-        main(["run", str(experiment_file)])
+def test_run_packaged_experiment_factory(capsys, monkeypatch, tmp_path: Path):
+    from strands_evals.components import ComponentSnapshot
+    from strands_evals.integrations import harbor as harbor_integration
+    from strands_evals.trials import TrialResult, TrialStatus
+
+    captured: dict = {"requests": []}
+
+    class FakeExecutor:
+        def __init__(self, trials_dir):
+            captured["trials_dir"] = trials_dir
+
+        def snapshot(self):
+            return ComponentSnapshot(kind="fake-executor")
+
+        async def run(self, request):
+            captured["requests"].append(request)
+            return TrialResult(
+                case_id=request.packaged_task.case_id,
+                repetition=request.repetition,
+                status=TrialStatus.COMPLETED,
+                metrics={"fixture_coverage": 0.5},
+            )
+
+    monkeypatch.setattr(harbor_integration, "HarborTrialExecutor", FakeExecutor)
+    output = tmp_path / "report.json"
+    run_dir = tmp_path / "runs"
+    trials_dir = tmp_path / "trials"
+
+    exit_code = main(
+        [
+            "--json",
+            "run",
+            "tests.strands_evals.cli.fixtures.experiments:packaged_experiment",
+            "--task-environment",
+            "local-containers",
+            "--run-dir",
+            str(run_dir),
+            "--trials-dir",
+            str(trials_dir),
+            "--repetitions",
+            "2",
+            "--max-workers",
+            "2",
+            "--fail-on",
+            "none",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(output.read_text())
+    assert report["manifest"]["repetitions"] == 2
+    assert len(report["results"]) == 2
+    assert report["compatibility_overall_score"] == 0.5
+    assert captured["trials_dir"] == trials_dir
+    assert len(captured["requests"]) == 2
+    assert (run_dir / "runs" / report["manifest"]["run_id"] / "report.json").is_file()
+    assert "primary=0.5000" in capsys.readouterr().err
+
+
+def test_run_packaged_experiment_keeps_cwd_target_importable(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from strands_evals import Experiment, StrandsAgentTarget
+    from strands_evals.components import ComponentSnapshot
+    from strands_evals.integrations import harbor as harbor_integration
+    from strands_evals.trials import TrialResult, TrialStatus
+    from tests.strands_evals.cli.fixtures import experiments
+
+    (tmp_path / "cwd_target.py").write_text("def create_agent():\n    return 'loaded-from-cwd'\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delitem(sys.modules, "cwd_target", raising=False)
+    assert str(tmp_path) not in sys.path
+
+    original = experiments.packaged_experiment()
+
+    def packaged_experiment():
+        return Experiment(
+            cases=original.cases,
+            evaluators=original.evaluators,
+            target=StrandsAgentTarget(factory="cwd_target:create_agent"),
+            repetitions=original.repetitions,
+            packaged_tasks=original.packaged_tasks,
+        )
+
+    monkeypatch.setattr(experiments, "packaged_experiment", packaged_experiment)
+    captured = {}
+
+    class ImportingExecutor:
+        def __init__(self, trials_dir):
+            del trials_dir
+
+        def snapshot(self):
+            return ComponentSnapshot(kind="importing-executor")
+
+        async def run(self, request):
+            module_name, attr_name = request.target.factory.split(":", 1)
+            factory = getattr(importlib.import_module(module_name), attr_name)
+            captured["factory_result"] = factory()
+            return TrialResult(
+                case_id=request.packaged_task.case_id,
+                repetition=request.repetition,
+                status=TrialStatus.COMPLETED,
+                metrics={"fixture_coverage": 1.0},
+            )
+
+    monkeypatch.setattr(
+        harbor_integration,
+        "HarborTrialExecutor",
+        ImportingExecutor,
+    )
+
+    assert (
+        main(
+            [
+                "run",
+                "tests.strands_evals.cli.fixtures.experiments:packaged_experiment",
+                "--run-dir",
+                str(tmp_path / "runs"),
+                "--output",
+                str(tmp_path / "report.json"),
+                "--fail-on",
+                "none",
+            ]
+        )
+        == 0
+    )
+    assert captured["factory_result"] == "loaded-from-cwd"
+    assert str(tmp_path) not in sys.path
+
+
+def test_run_packaged_experiment_resumes_terminal_results(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from strands_evals.components import ComponentSnapshot
+    from strands_evals.integrations import harbor as harbor_integration
+    from strands_evals.trials import TrialResult, TrialStatus
+
+    calls = []
+
+    class FakeExecutor:
+        def __init__(self, trials_dir):
+            self.trials_dir = trials_dir
+
+        def snapshot(self):
+            return ComponentSnapshot(kind="fake-executor")
+
+        async def run(self, request):
+            calls.append(request)
+            return TrialResult(
+                case_id=request.packaged_task.case_id,
+                repetition=request.repetition,
+                status=TrialStatus.COMPLETED,
+                metrics={"fixture_coverage": 1.0},
+            )
+
+    monkeypatch.setattr(harbor_integration, "HarborTrialExecutor", FakeExecutor)
+    run_dir = tmp_path / "run-store"
+    first_output = tmp_path / "first.json"
+    common = [
+        "run",
+        "tests.strands_evals.cli.fixtures.experiments:packaged_experiment",
+        "--run-dir",
+        str(run_dir),
+        "--fail-on",
+        "none",
+    ]
+
+    assert main([*common, "--output", str(first_output)]) == 0
+    run_id = json.loads(first_output.read_text())["manifest"]["run_id"]
+    assert len(calls) == 1
+
+    second_output = tmp_path / "second.json"
+    assert (
+        main(
+            [
+                *common,
+                "--resume",
+                run_id,
+                "--output",
+                str(second_output),
+            ]
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    assert json.loads(second_output.read_text())["manifest"]["run_id"] == run_id
+
+
+def test_run_requires_agent_or_task(experiment_file: Path, capsys):
+    assert main(["run", str(experiment_file)]) == 2
+    assert "requires --agent or --task" in capsys.readouterr().err
 
 
 def test_run_agent_and_task_mutually_exclusive(experiment_file: Path):

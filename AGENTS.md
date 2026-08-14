@@ -53,6 +53,16 @@ strands-evals/
 ├── src/strands_evals/                        # Main package source code
 │   ├── __init__.py                           # Public API exports
 │   ├── case.py                               # Case[InputT, OutputT] test scenario
+│   ├── benchmarks.py                         # Packaged benchmark loading
+│   ├── components.py                         # Serializable component snapshots
+│   ├── packaged_tasks.py                     # Executor-neutral packaged-task refs
+│   ├── targets.py                            # Declarative evaluation targets
+│   ├── task_environments.py                  # Declarative task placements
+│   ├── trials.py                             # Trial requests/results/status models
+│   ├── runner.py                             # Repetition-aware packaged runner
+│   ├── run_store.py                          # Versioned manifests and atomic results
+│   ├── run_report.py                         # Named-metric packaged reports
+│   ├── integrations/harbor.py                # Harbor trial executor
 │   ├── experiment.py                         # Experiment orchestration + run_evaluations
 │   ├── eval_task_handler.py                  # EvalTaskHandler, TracedHandler, @eval_task
 │   ├── evaluation_data_store.py              # EvaluationDataStore
